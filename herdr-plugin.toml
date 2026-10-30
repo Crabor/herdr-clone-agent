@@ -1,0 +1,18 @@
+id = "herdr-clone-agent"
+name = "Clone Agent"
+version = "0.1.0"
+min_herdr_version = "0.9.2"
+description = "Clone the coding agent of a pane into a new right/down pane. Auto-detects the agent kind via herdr and calls that agent's own clone/fork (pi --fork, claude --resume --fork-session). Bind keys with type=plugin_action or invoke from the pane menu."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "clone-right"
+title = "Clone agent right"
+contexts = ["pane", "global"]
+command = ["bash", "clone-agent.sh", "right"]
+
+[[actions]]
+id = "clone-down"
+title = "Clone agent down"
+contexts = ["pane", "global"]
+command = ["bash", "clone-agent.sh", "down"]
