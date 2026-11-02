@@ -8,7 +8,7 @@ The plugin auto-detects which agent occupies the source pane via Herdr's agent s
 |---|---|---|
 | [pi](https://github.com/earendil-works/pi) | `pi --fork <session>` | ✅ tested |
 | Claude Code | `claude --resume <id> --fork-session` | ✅ wired, community-tested welcome |
-| others (codex, gemini, …) | rejected with a clear error | only resume semantics exist today; two live panes sharing one session would fight, so cloning is intentionally unsupported until the agent ships a fork |
+| [Codex](https://github.com/openai/codex) | `codex fork <session-id>` | ✅ tested |
 
 ![demo](docs/demo.mp4)
 

@@ -6,7 +6,7 @@
 #   $HERDR_ACTIVE_PANE_ID (custom shell command context)
 #   HERDR_PLUGIN_CONTEXT_JSON .focused_pane_id
 # Agent kind + session come from `herdr agent get`, then a per-kind dispatch
-# builds the clone argv (pi --fork / claude --resume --fork-session).
+# builds the clone argv (pi --fork / claude --resume --fork-session / codex fork).
 set -euo pipefail
 
 err() { printf 'clone-agent: %s\n' "$*" >&2; exit 1; }
@@ -29,14 +29,31 @@ KIND="$(jq -r '.result.agent.agent // empty' <<<"$AGENT_JSON")"
 SESS_KIND="$(jq -r '.result.agent.agent_session.kind // empty' <<<"$AGENT_JSON")"
 SESS_VAL="$(jq -r '.result.agent.agent_session.value // empty' <<<"$AGENT_JSON")"
 SRC_CWD="$(jq -r '.result.agent.cwd // empty' <<<"$AGENT_JSON")"
-[[ -n "$KIND" && -n "$SESS_VAL" ]] || err "pane $SRC agent '$KIND' reports no session reference"
+[[ -n "$KIND" ]] || err "pane $SRC has no recognized agent (nothing to clone)"
+
+# --- Codex fallback: recover session ID from the pane's process environment ---
+# Codex does not always report agent_session to herdr, but the running process
+# carries CODEX_THREAD_ID in its environment.  Read it via /proc/<pid>/environ.
+if [[ "$KIND" == "codex" && -z "$SESS_VAL" ]]; then
+  FG_PID="$(jq -r '.result.process_info.foreground_processes[0].pid // empty' \
+    <<<"$("$HERDR" pane process-info --pane "$SRC")")"
+  if [[ -n "$FG_PID" && -r "/proc/$FG_PID/environ" ]]; then
+    SESS_VAL="$(tr '\0' '\n' < "/proc/$FG_PID/environ" \
+      | sed -n 's/^CODEX_THREAD_ID=//p' | head -1)"
+    SESS_KIND="id"          # treat as an opaque ID
+  fi
+  [[ -n "$SESS_VAL" ]] || err "codex agent in pane $SRC has no session (CODEX_THREAD_ID not found in pid ${FG_PID:-?})"
+fi
+
+[[ -n "$SESS_VAL" ]] || err "pane $SRC agent '$KIND' reports no session reference"
 
 # Per-kind clone dispatch. Only include kinds with true fork/clone semantics;
 # a plain resume would make two live panes share one session.
 case "$KIND:$SESS_KIND" in
-  pi:path|pi:id)   CLONE_ARGS=(--fork "$SESS_VAL") ;;
-  claude:id|claude:path) CLONE_ARGS=(--resume "$SESS_VAL" --fork-session) ;;
-  *) err "agent '$KIND' (session kind '$SESS_KIND') has no supported clone command yet; supported: pi, claude" ;;
+  pi:path|pi:id)           CLONE_ARGS=(--fork "$SESS_VAL") ;;
+  claude:id|claude:path)   CLONE_ARGS=(--resume "$SESS_VAL" --fork-session) ;;
+  codex:id|codex:path)     CLONE_ARGS=(fork "$SESS_VAL") ;;
+  *) err "agent '$KIND' (session kind '$SESS_KIND') has no supported clone command yet; supported: pi, claude, codex" ;;
 esac
 
 # Unique agent name among live agents.
