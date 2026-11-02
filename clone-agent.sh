@@ -19,8 +19,6 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 command -v jq >/dev/null || err "jq not found in PATH"
 
 # --- Resolve source pane ID with staleness detection ---
-# HERDR_PANE_ID can become stale when an agent is migrated to a new pane.
-# We validate the candidate and fall back to searching the pane list.
 validate_pane() {
   local pid="$1"
   [[ -n "$pid" ]] || return 1
@@ -33,22 +31,14 @@ if [[ -z "$SRC" && -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]]; then
 fi
 
 if ! validate_pane "$SRC"; then
-  # Candidate is empty or stale. Search pane list for the real source pane.
   PANE_LIST="$("$HERDR" pane list 2>/dev/null)" || true
-
-  # Detect agent kind from environment for targeted search
   _detect_kind=""
-  if [[ -n "${PI_SESSION_FILE:-}" ]]; then
-    _detect_kind="pi"
-  elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
-    _detect_kind="codex"
-  elif [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then
-    _detect_kind="claude"
+  if [[ -n "${PI_SESSION_FILE:-}" ]]; then _detect_kind="pi"
+  elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then _detect_kind="codex"
+  elif [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then _detect_kind="claude"
   fi
 
   if [[ -n "$_detect_kind" && -n "$PANE_LIST" ]]; then
-    # Prefer "working" panes (active session) over "idle" ones.
-    # Sort: working first, then take last match (most recently created).
     SRC="$(jq -r --arg kind "$_detect_kind" '
       [.result.panes[] | select(.agent == $kind)] |
       sort_by(if .agent_status == "working" then 0 else 1 end) |
@@ -68,11 +58,14 @@ SRC_CWD="$(jq -r '.result.agent.cwd // empty' <<<"$AGENT_JSON")"
 [[ -n "$KIND" ]] || err "pane $SRC has no recognized agent (nothing to clone)"
 
 # --- Codex session recovery ---
-# Codex does not always report agent_session to herdr (returns null), and the
-# node process may not expose CODEX_THREAD_ID in /proc/<pid>/environ.
-# Recovery chain: agent_session → /proc environ → $CODEX_THREAD_ID env var.
+# herdr does not track codex agent_session. Recovery chain:
+#   1. agent_session from herdr (usually null for codex)
+#   2. /proc/<pid>/environ CODEX_THREAD_ID
+#   3. $CODEX_THREAD_ID env var (only available inside codex's own shell)
+#   4. ~/.codex/history.jsonl most recent session_id
+#   5. codex fork --last (let codex CLI resolve it)
 if [[ "$KIND" == "codex" && -z "$SESS_VAL" ]]; then
-  # Try /proc/<pid>/environ first
+  # Try /proc/<pid>/environ
   FG_PID="$(jq -r '.result.process_info.foreground_processes[0].pid // empty' \
     <<<"$("$HERDR" pane process-info --pane "$SRC" 2>/dev/null)")"
   if [[ -n "$FG_PID" && -r "/proc/$FG_PID/environ" ]]; then
@@ -81,28 +74,43 @@ if [[ "$KIND" == "codex" && -z "$SESS_VAL" ]]; then
     SESS_KIND="id"
   fi
 
-  # Final fallback: $CODEX_THREAD_ID from the calling shell environment.
-  # This works when clone-to is invoked from within the codex agent's own shell.
+  # Try $CODEX_THREAD_ID from calling shell environment
   if [[ -z "$SESS_VAL" && -n "${CODEX_THREAD_ID:-}" ]]; then
     SESS_VAL="$CODEX_THREAD_ID"
     SESS_KIND="id"
   fi
 
-  [[ -n "$SESS_VAL" ]] || err "codex agent in pane $SRC has no session (checked: agent_session, /proc/${FG_PID:-?}/environ, \$CODEX_THREAD_ID)"
+  # Try ~/.codex/history.jsonl — most recent session_id
+  if [[ -z "$SESS_VAL" ]]; then
+    CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+    HIST_FILE="$CODEX_HOME/history.jsonl"
+    if [[ -r "$HIST_FILE" ]]; then
+      SESS_VAL="$(tail -1 "$HIST_FILE" 2>/dev/null \
+        | jq -r '.session_id // empty' 2>/dev/null)" || true
+      SESS_KIND="id"
+    fi
+  fi
+
+  # Final fallback: use --last flag and let codex CLI pick
+  if [[ -z "$SESS_VAL" ]]; then
+    SESS_VAL="--last"
+    SESS_KIND="flag"
+  fi
 fi
 
 [[ -n "$SESS_VAL" ]] || err "pane $SRC agent '$KIND' reports no session reference"
 
-# Per-kind clone dispatch. Only include kinds with true fork/clone semantics;
-# a plain resume would make two live panes share one session.
+# Per-kind clone dispatch
 case "$KIND:${SESS_KIND:-unknown}" in
   pi:path|pi:id)           CLONE_ARGS=(--fork "$SESS_VAL") ;;
   claude:id|claude:path)   CLONE_ARGS=(--resume "$SESS_VAL" --fork-session) ;;
-  codex:id|codex:path|codex:unknown) CLONE_ARGS=(fork "$SESS_VAL") ;;
+  codex:id|codex:path)     CLONE_ARGS=(fork "$SESS_VAL") ;;
+  codex:flag)              CLONE_ARGS=(fork "$SESS_VAL") ;;  # --last
+  codex:unknown)           CLONE_ARGS=(fork --last) ;;
   *) err "agent '$KIND' (session kind '${SESS_KIND:-unknown}') has no supported clone command yet; supported: pi, claude, codex" ;;
 esac
 
-# Unique agent name among live agents.
+# Unique agent name among live agents
 live_names() { "$HERDR" agent list | jq -r '.result.agents[]?.name // empty'; }
 NAME=""
 for _ in 1 2 3 4 5; do
