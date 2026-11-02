@@ -62,7 +62,7 @@ SRC_CWD="$(jq -r '.result.agent.cwd // empty' <<<"$AGENT_JSON")"
 #   1. agent_session from herdr (usually null for codex)
 #   2. /proc/<pid>/environ CODEX_THREAD_ID
 #   3. $CODEX_THREAD_ID env var (only available inside codex's own shell)
-#   4. ~/.codex/history.jsonl most recent session_id
+#   4. ~/.codex/sessions rollout files — match by pane cwd, newest mtime first
 #   5. codex fork --last (let codex CLI resolve it)
 if [[ "$KIND" == "codex" && -z "$SESS_VAL" ]]; then
   # Try /proc/<pid>/environ
@@ -80,15 +80,21 @@ if [[ "$KIND" == "codex" && -z "$SESS_VAL" ]]; then
     SESS_KIND="id"
   fi
 
-  # Try ~/.codex/history.jsonl — most recent session_id
-  if [[ -z "$SESS_VAL" ]]; then
+  # Try ~/.codex/sessions rollout files — match by pane cwd (exact or basename),
+  # sorted by file mtime descending so the most recently active session wins.
+  if [[ -z "$SESS_VAL" && -n "$SRC_CWD" ]]; then
     CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-    HIST_FILE="$CODEX_HOME/history.jsonl"
-    if [[ -r "$HIST_FILE" ]]; then
-      SESS_VAL="$(tail -1 "$HIST_FILE" 2>/dev/null \
-        | jq -r '.session_id // empty' 2>/dev/null)" || true
-      SESS_KIND="id"
-    fi
+    PANE_BASENAME="$(basename "$SRC_CWD")"
+    SESS_VAL="$(find "$CODEX_HOME/sessions" -name 'rollout-*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -rn | while read -r _ts fpath; do
+          head -1 "$fpath" 2>/dev/null | jq -r --arg pcwd "$SRC_CWD" --arg pbase "$PANE_BASENAME" '
+            select(.type == "session_meta") |
+            .payload |
+            select(.cwd == $pcwd or ((.cwd // "") | split("/") | last) == $pbase) |
+            .session_id // empty
+          ' 2>/dev/null
+        done | head -1)" || true
+    [[ -n "$SESS_VAL" ]] && SESS_KIND="id"
   fi
 
   # Final fallback: use --last flag and let codex CLI pick
